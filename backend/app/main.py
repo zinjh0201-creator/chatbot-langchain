@@ -100,3 +100,6 @@ async def ingest_pdf(file: UploadFile = File(...)) -> IngestResponse:
         doc_id = await conn.fetchval(sql, title, content, emb)
     return IngestResponse(id=str(doc_id))
 
+
+from mangum import Mangum
+handler = Mangum(app)
