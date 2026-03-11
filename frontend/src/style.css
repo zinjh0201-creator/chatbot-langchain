@@ -467,7 +467,6 @@ code {
   top: 16px;
   left: 50%;
   transform: translateX(-50%);
-  background: #10b981; /* Emerald green */
   color: white;
   padding: 10px 20px;
   border-radius: var(--radius-full);
@@ -478,6 +477,14 @@ code {
   animation: slideDown 0.3s ease-out, fadeOut 0.3s ease-in 2.7s forwards;
 }
 
+.toast-success {
+  background: #10b981; /* Emerald green */
+}
+
+.toast-error {
+  background: #ef4444; /* Red */
+}
+
 @keyframes slideDown {
   from { opacity: 0; transform: translate(-50%, -20px); }
   to { opacity: 1; transform: translate(-50%, 0); }
@@ -485,6 +492,61 @@ code {
 @keyframes fadeOut {
   from { opacity: 1; }
   to { opacity: 0; visibility: hidden; }
+}
+
+/* Status Badge */
+.statusBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: var(--radius-full);
+  background: var(--bg);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  transition: all 0.3s ease;
+}
+
+.statusDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.statusBadge.online {
+  color: #047857;
+  background: #d1fae5;
+  border-color: #a7f3d0;
+}
+.statusBadge.online .statusDot {
+  background: #10b981;
+}
+
+.statusBadge.offline {
+  color: #b91c1c;
+  background: #fee2e2;
+  border-color: #fca5a5;
+}
+.statusBadge.offline .statusDot {
+  background: #ef4444;
+}
+
+.statusBadge.checking {
+  color: #b45309;
+  background: #fef3c7;
+  border-color: #fde68a;
+}
+.statusBadge.checking .statusDot {
+  background: #f59e0b;
+  animation: pulseDot 1.5s infinite;
+}
+
+@keyframes pulseDot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
 }
 
 /* Metadata (Badges, Sources) */

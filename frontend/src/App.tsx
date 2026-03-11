@@ -57,11 +57,12 @@ export default function App() {
 
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   
-  // Document Management State
+  // Document Management & System State
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [isDocListOpen, setIsDocListOpen] = useState(false);
   const [loadingDocs, setLoadingDocs] = useState(false);
-  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [toastMessage, setToastMessage] = useState<{ text: string; type: "success" | "error" } | null>(null);
+  const [backendStatus, setBackendStatus] = useState<"checking" | "online" | "offline">("checking");
 
   const listRef = useRef<HTMLDivElement | null>(null);
 
@@ -76,10 +77,30 @@ export default function App() {
     });
   }, [messages.length, pending]);
 
-  const showToast = useCallback((msg: string) => {
-    setToastMessage(msg);
+  const showToast = useCallback((text: string, type: "success" | "error" = "success") => {
+    setToastMessage({ text, type });
     setTimeout(() => setToastMessage(null), 3000);
   }, []);
+
+  // Check Backend Health
+  const checkHealth = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/health`);
+      if (res.ok) {
+        setBackendStatus("online");
+      } else {
+        setBackendStatus("offline");
+      }
+    } catch (e) {
+      setBackendStatus("offline");
+    }
+  }, []);
+
+  useEffect(() => {
+    void checkHealth();
+    const interval = setInterval(() => void checkHealth(), 30000); // Check every 30s
+    return () => clearInterval(interval);
+  }, [checkHealth]);
 
   const fetchDocuments = useCallback(async () => {
     setLoadingDocs(true);
@@ -88,13 +109,17 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setDocuments(data.documents || []);
+        if (backendStatus === "offline") setBackendStatus("online");
+      } else {
+        setBackendStatus("offline");
       }
     } catch (e) {
       console.error("Failed to fetch documents", e);
+      setBackendStatus("offline");
     } finally {
       setLoadingDocs(false);
     }
-  }, []);
+  }, [backendStatus]);
 
   useEffect(() => {
     void fetchDocuments();
@@ -105,13 +130,14 @@ export default function App() {
     try {
       const res = await fetch(`${API_BASE}/documents/${id}`, { method: "DELETE" });
       if (res.ok) {
-        showToast("문서가 삭제되었습니다.");
+        showToast("문서가 삭제되었습니다.", "success");
         void fetchDocuments();
       } else {
-        alert("문서 삭제에 실패했습니다.");
+        showToast("문서 삭제 거부됨 혹은 서버 에러.", "error");
       }
     } catch (e) {
-      alert("문서 삭제 중 오류가 발생했습니다.");
+      showToast("서버와 통신할 수 없습니다.", "error");
+      setBackendStatus("offline");
     }
   }, [fetchDocuments, showToast]);
 
@@ -123,6 +149,11 @@ export default function App() {
   async function send() {
     const text = input.trim();
     if (!text || pending) return;
+
+    if (backendStatus === "offline") {
+      showToast("현재 서버에 연결할 수 없습니다. 잠시 후 다시 시도해 주세요.", "error");
+      return;
+    }
 
     setInput("");
     const userMsg: ChatMessage = { id: uid(), role: "user", text };
@@ -151,7 +182,10 @@ export default function App() {
         },
       };
       setMessages((m) => [...m, assistantMsg]);
+      setBackendStatus("online");
     } catch (e) {
+      setBackendStatus("offline");
+      showToast("답변 요청 중 오류가 발생하여 실패했습니다.", "error");
       const assistantMsg: ChatMessage = {
         id: uid(),
         role: "assistant",
@@ -164,6 +198,11 @@ export default function App() {
   }
 
   const uploadPdf = useCallback(async (file: File) => {
+    if (backendStatus === "offline") {
+      showToast("서버가 오프라인이므로 파일을 업로드할 수 없습니다.", "error");
+      return;
+    }
+
     if (!file.name.toLowerCase().endsWith(".pdf")) {
       setUploadError("PDF 파일만 업로드 가능합니다.");
       return;
@@ -186,14 +225,16 @@ export default function App() {
         throw new Error(err.detail || `업로드 실패 (${res.status})`);
       }
       setUploadError(null);
-      showToast("문서 업로드 및 분석이 완료되었습니다!");
+      showToast("문서 업로드 및 분석이 완료되었습니다!", "success");
       void fetchDocuments(); // Refresh document list
     } catch (e) {
       setUploadError(e instanceof Error ? e.message : "업로드 실패");
+      showToast("문서 업로드 파일 전송 중 오류가 발생했습니다.", "error");
+      setBackendStatus("offline");
     } finally {
       setUploading(false);
     }
-  }, [fetchDocuments, showToast]);
+  }, [fetchDocuments, showToast, backendStatus]);
 
   const onFileChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -231,7 +272,11 @@ export default function App() {
 
   return (
     <div className="page">
-      {toastMessage && <div className="toast">{toastMessage}</div>}
+      {toastMessage && (
+        <div className={`toast toast-${toastMessage.type}`}>
+          {toastMessage.text}
+        </div>
+      )}
       
       <aside className={`sidebar ${isSidebarOpen ? "" : "closed"}`}>
         <div className="sidebarHeaderRow">
@@ -328,7 +373,13 @@ export default function App() {
               </button>
             )}
             <div className="titles">
-              <h1 className="title">생산성 강화 RAG 챗봇</h1>
+              <div className="titleRow" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <h1 className="title">생산성 강화 RAG 챗봇</h1>
+                <div className={`statusBadge ${backendStatus}`}>
+                  <span className="statusDot" />
+                  {backendStatus === "checking" ? "연결 확인 중" : backendStatus === "online" ? "서버 정상" : "연결 끊김"}
+                </div>
+              </div>
               <p className="subtitle">
                 사내 규정, 매뉴얼 등 PDF를 업로드하고 질문해 보세요.
               </p>
