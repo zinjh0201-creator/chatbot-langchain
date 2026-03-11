@@ -22,7 +22,8 @@ type ChatResponse = {
 
 // const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:8000'
 const API_BASE =
-  window.location.hostname === "localhost" ? "http://localhost:8000" : "/api";
+  import.meta.env.VITE_API_BASE ||
+  (window.location.hostname === "localhost" ? "http://localhost:8000" : "/api");
 const STORAGE_KEY = "ragchat.messages.v1";
 const MAX_PDF_MB = 200;
 
