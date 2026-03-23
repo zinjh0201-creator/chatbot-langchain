@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     similarity_threshold: float = Field(default=0.7, alias="SIMILARITY_THRESHOLD")
     top_k: int = Field(default=3, alias="TOP_K")
 
-    cors_origins: str = Field(default="http://localhost:5173", alias="CORS_ORIGINS")
+    cors_origins: str = Field(default="*", alias="CORS_ORIGINS")
 
     @property
     def cors_origins_list(self) -> list[str]:

@@ -43,3 +43,21 @@ def generate_answer(prompt: str) -> str:
         return ""
     return text.strip()
 
+
+def generate_answer_stream(prompt: str):
+    """Gemini 답변을 생성합니다 (스트리밍 시뮬레이션)"""
+    client = _client()
+    # Gemini API는 stream 파라미터를 지원하지 않으므로
+    # 전체 응답을 받은 후 문자 단위로 스트리밍합니다
+    res = client.models.generate_content(
+        model=settings.gemini_chat_model,
+        contents=prompt,
+    )
+    text = getattr(res, "text", "")
+    if not text:
+        return
+    
+    # 문자 단위로 yield (스트리밍 효과)
+    for char in text:
+        yield char
+

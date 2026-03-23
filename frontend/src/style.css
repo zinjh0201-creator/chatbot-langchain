@@ -380,6 +380,38 @@ code {
   font-family: inherit;
 }
 
+.msgCopyBtn {
+  visibility: hidden;
+  position: relative;
+  background: transparent;
+  border: none;
+  padding: 4px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 18px;
+  transition: all 0.15s ease;
+  opacity: 0;
+  flex-shrink: 0;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.msgRow:hover .msgCopyBtn {
+  visibility: visible;
+  opacity: 1;
+}
+
+.msgCopyBtn:hover {
+  background: rgba(0, 0, 0, 0.06);
+  transform: scale(1.1);
+}
+
+.msgCopyBtn:active {
+  transform: scale(0.95);
+}
+
 /* Document List Area in Sidebar */
 .docListContainer {
   margin-top: 24px;
@@ -631,11 +663,59 @@ code {
 
 .sources ul {
   margin: 8px 0 0;
-  padding-left: 20px;
-  color: var(--muted);
+  padding-left: 0;
+  list-style: none;
 }
-.sources li {
-  margin-bottom: 4px;
+
+.source-item {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  background: var(--blueLight);
+  border-left: 3px solid var(--blue);
+  border-radius: 6px;
+  margin-left: 0;
+}
+
+.source-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+
+.source-header strong {
+  color: var(--text);
+  font-size: 0.95rem;
+  flex: 1;
+}
+
+.page-badge {
+  background: var(--blue);
+  color: white;
+  font-size: 0.75rem;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-weight: 500;
+}
+
+.similarity-badge {
+  background: #10b981;
+  color: white;
+  font-size: 0.75rem;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-weight: 500;
+}
+
+.source-snippet {
+  font-size: 0.85rem;
+  color: var(--text);
+  font-style: italic;
+  line-height: 1.4;
+  padding: 6px 0;
+  border-top: 1px solid var(--blueBorder);
+  padding-top: 6px;
 }
 
 /* Composer (Fixed Bottom) */
