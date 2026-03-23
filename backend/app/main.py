@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import io
+import logging
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pypdf import PdfReader
+
+# 로깅 설정 (모듈 import 시 자동으로 초기화)
+from . import logging_config
 
 from .config import settings
 from .db import create_pool
@@ -11,6 +15,7 @@ from .models import ChatRequest, ChatResponse, IngestRequest, IngestResponse, Do
 from .rag import answer_with_rag
 from .gemini_client import embed_text
 
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="RAG Chatbot (Supabase + Gemini)")
 
@@ -25,14 +30,19 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def _startup() -> None:
+    logger.info("Starting RAG Chatbot application...")
     app.state.pool = await create_pool()
+    logger.info("Database pool created successfully")
+    logger.info("Application initialization completed")
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
+    logger.info("Shutting down RAG Chatbot application...")
     pool = getattr(app.state, "pool", None)
     if pool is not None:
         await pool.close()
+        logger.info("Database pool closed")
 
 
 @app.get("/health")
@@ -105,12 +115,19 @@ async def delete_document(title: str) -> dict:
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
+    logger.info(f"Chat request: {req.message[:50]}...")
     pool = getattr(app.state, "pool", None)
     if pool is None:
+        logger.error("DB pool not initialized")
         raise HTTPException(status_code=500, detail="DB pool not initialized")
 
-    answer, mode, similarity, sources = await answer_with_rag(pool, req.message, req.history)
-    return ChatResponse(answer=answer, mode=mode, similarity=similarity, sources=sources)
+    try:
+        answer, mode, similarity, sources = await answer_with_rag(pool, req.message, req.history)
+        logger.info(f"Chat completed - mode: {mode}, similarity: {similarity}")
+        return ChatResponse(answer=answer, mode=mode, similarity=similarity, sources=sources)
+    except Exception as e:
+        logger.error(f"Chat error: {str(e)}", exc_info=True)
+        raise
 
 
 @app.post("/chat-stream")
@@ -154,18 +171,25 @@ async def ingest(req: IngestRequest) -> IngestResponse:
 
 @app.post("/ingest-pdf", response_model=IngestResponse)
 async def ingest_pdf(file: UploadFile = File(...)) -> IngestResponse:
+    logger.info(f"PDF ingestion started: {file.filename}")
+    
     if not file.filename or not file.filename.lower().endswith(".pdf"):
+        logger.warning(f"Invalid file type: {file.filename}")
         raise HTTPException(status_code=400, detail="PDF 파일만 업로드 가능합니다.")
+    
     pool = getattr(app.state, "pool", None)
     if pool is None:
+        logger.error("DB pool not initialized")
         raise HTTPException(status_code=500, detail="DB pool not initialized")
 
     raw = await file.read()
     title = file.filename or "PDF 문서"
     chunks_to_insert = []
+    logger.debug(f"PDF file read: {len(raw)} bytes")
     
     try:
         reader = PdfReader(io.BytesIO(raw))
+        logger.info(f"PDF parsing started: {len(reader.pages)} pages")
         
         # 페이지별로 처리
         for page_idx, page in enumerate(reader.pages, start=1):
@@ -206,10 +230,15 @@ async def ingest_pdf(file: UploadFile = File(...)) -> IngestResponse:
                     "content": current_chunk.strip(),
                     "embedding": embedding,
                 })
+        
+        logger.info(f"PDF chunks created: {len(chunks_to_insert)} chunks")
+        
     except Exception as e:
+        logger.error(f"PDF parsing failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=400, detail=f"PDF 파싱 실패: {e!s}") from e
     
     if not chunks_to_insert:
+        logger.warning("No text extracted from PDF")
         raise HTTPException(status_code=400, detail="PDF에서 텍스트를 추출할 수 없습니다.")
 
     # DB에 모든 청크 삽입
@@ -218,19 +247,27 @@ async def ingest_pdf(file: UploadFile = File(...)) -> IngestResponse:
         VALUES ($1, $2, $3, $4, $5)
         RETURNING id::text
     """
-    async with pool.acquire() as conn:
-        doc_id = None
-        for chunk in chunks_to_insert:
-            doc_id = await conn.fetchval(
-                sql,
-                chunk["title"],
-                chunk["page_num"],
-                chunk["chunk_index"],
-                chunk["content"],
-                chunk["embedding"],
-            )
+    try:
+        async with pool.acquire() as conn:
+            doc_id = None
+            for idx, chunk in enumerate(chunks_to_insert, 1):
+                doc_id = await conn.fetchval(
+                    sql,
+                    chunk["title"],
+                    chunk["page_num"],
+                    chunk["chunk_index"],
+                    chunk["content"],
+                    chunk["embedding"],
+                )
+                if idx % 10 == 0:
+                    logger.debug(f"Inserted {idx}/{len(chunks_to_insert)} chunks")
+        
+        logger.info(f"PDF ingestion completed: {len(chunks_to_insert)} chunks stored, id={doc_id}")
+        return IngestResponse(id=str(doc_id))
     
-    return IngestResponse(id=str(doc_id))
+    except Exception as e:
+        logger.error(f"Database insertion failed: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"데이터베이스 저장 실패: {e!s}") from e
 
 
 from mangum import Mangum

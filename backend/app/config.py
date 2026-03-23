@@ -14,9 +14,9 @@ class Settings(BaseSettings):
     db_url: str = Field(alias="DB_URL")
     gemini_api_key: str = Field(alias="GEMINI_API_KEY")
 
-    gemini_chat_model: str = Field(default="gemini-1.5-flash", alias="GEMINI_CHAT_MODEL")
+    gemini_chat_model: str = Field(default="models/gemini-1.5-flash", alias="GEMINI_CHAT_MODEL")
     gemini_embedding_model: str = Field(
-        default="gemini-embedding-001", alias="GEMINI_EMBEDDING_MODEL"
+        default="models/embedding-001", alias="GEMINI_EMBEDDING_MODEL"
     )
 
     similarity_threshold: float = Field(default=0.7, alias="SIMILARITY_THRESHOLD")

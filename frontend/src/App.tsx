@@ -52,6 +52,7 @@ export default function App() {
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
+  const [isInputExpanded, setIsInputExpanded] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [messages, setMessages] = useState<ChatMessage[]>(() => {
     try {
@@ -589,31 +590,44 @@ export default function App() {
 
         <div className="composerWrapper">
           <div className="composer">
-            <textarea
-              className="input"
-              rows={1}
-              placeholder="메시지를 입력하세요 (Shift + Enter로 줄바꿈)"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  void send();
-                }
-              }}
-              disabled={pending}
-            />
-            <button
-              type="button"
-              className="sendBtn"
-              onClick={() => void send()}
-              disabled={!canSend}
-              aria-label="전송"
-            >
-              <span className="sendArrow" aria-hidden>
-                ↑
-              </span>
-            </button>
+            <div className="composerHeader">
+              <button
+                type="button"
+                className={`expandBtn ${isInputExpanded ? "expanded" : ""}`}
+                onClick={() => setIsInputExpanded(!isInputExpanded)}
+                title={isInputExpanded ? "축소" : "확장"}
+                aria-label={isInputExpanded ? "축소" : "확장"}
+              >
+                ⬍
+              </button>
+            </div>
+            <div className="composerInputRow">
+              <textarea
+                className={`input ${isInputExpanded ? "expanded" : ""}`}
+                rows={isInputExpanded ? 5 : 1}
+                placeholder="메시지를 입력하세요 (Shift + Enter로 줄바꿈)"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    void send();
+                  }
+                }}
+                disabled={pending}
+              />
+              <button
+                type="button"
+                className="sendBtn"
+                onClick={() => void send()}
+                disabled={!canSend}
+                aria-label="전송"
+              >
+                <span className="sendArrow" aria-hidden>
+                  ↑
+                </span>
+              </button>
+            </div>
           </div>
         </div>
       </main>

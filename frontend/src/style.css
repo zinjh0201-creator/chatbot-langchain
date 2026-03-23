@@ -726,14 +726,56 @@ code {
 
 .composer {
   display: flex;
-  gap: 12px;
-  align-items: flex-end;
+  flex-direction: column;
+  gap: 8px;
   padding: 12px;
   border-radius: var(--radius-lg);
   border: 1px solid var(--border);
   background: var(--white);
   box-shadow: var(--shadow-md);
   transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.composerHeader {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0;
+  margin-bottom: 4px;
+}
+
+.expandBtn {
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--white);
+  color: var(--muted);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+  font-size: 18px;
+  padding: 0;
+}
+
+.expandBtn:hover {
+  background: var(--blueLight);
+  border-color: var(--blueBorder);
+  color: var(--blue);
+}
+
+.expandBtn.expanded {
+  background: var(--blueLight);
+  border-color: var(--blueBorder);
+  color: var(--blue);
+}
+
+.composerInputRow {
+  display: flex;
+  gap: 12px;
+  align-items: flex-end;
 }
 
 .composer:focus-within {
@@ -753,6 +795,11 @@ code {
   background: transparent;
   outline: none;
   max-height: 200px;
+  transition: max-height 0.2s;
+}
+
+.input.expanded {
+  max-height: 300px;
 }
 
 .input::placeholder {
