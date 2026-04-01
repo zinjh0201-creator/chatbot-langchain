@@ -1,29 +1,31 @@
 """
-LangChain 기반 RAG (Retrieval-Augmented Generation) 모듈
+LangChain 기반 RAG (Retrieval-Augmented Generation) 핵심 파이프라인
 
-주요 기능:
-- PyPDFLoader, RecursiveCharacterTextSplitter를 사용한 문서 분할
-- SupabaseVectorStore를 사용한 벡터 저장소 관리
-- ChatGoogleGenerativeAI를 사용한 응답 생성
-- LCEL 기반 비동기 처리 및 스트리밍
-- MultiQueryRetriever를 사용한 다중 쿼리 검색
+리팩토링 사항:
+1. 임베딩 로직 단일화 (LangChain 객체 사용)
+2. 고성능 청킹 (RecursiveCharacterTextSplitter)
+3. 배치 임베딩 및 벌크 인서트 (속도 향상)
+4. 검색 로직 경량화 및 프롬프트 고도화 (환각 방지)
 """
 
 from __future__ import annotations
 
 import asyncpg
 import logging
-from typing import AsyncGenerator
+import json
+from typing import AsyncGenerator, List, Dict, Any
 from dataclasses import dataclass
 
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_core.chat_history import BaseChatMessageHistory
 
 from .config import settings
 
 logger = logging.getLogger(__name__)
-
 
 @dataclass(frozen=True)
 class RetrievedDoc:
@@ -37,300 +39,216 @@ class RetrievedDoc:
 
     @property
     def snippet(self) -> str:
-        """첫 200자를 인용 문장으로 반환"""
         text = self.content.strip()
-        if len(text) > 200:
-            return text[:200] + "..."
-        return text
+        return text[:200] + "..." if len(text) > 200 else text
 
+class SessionChatMessageHistory(BaseChatMessageHistory):
+    """세션 기반 대화 히스토리 (메모리 저장소)"""
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.messages: list[BaseMessage] = []
+    
+    def add_message(self, message: BaseMessage) -> None:
+        self.messages.append(message)
+    
+    def clear(self) -> None:
+        self.messages.clear()
+        
+    @property
+    def messages(self) -> list[BaseMessage]:
+        return self._messages
+    
+    @messages.setter
+    def messages(self, value: list[BaseMessage]) -> None:
+        self._messages = value
 
 class SupabaseRAGPipeline:
-    """LangChain 기반 RAG 파이프라인"""
-    
     def __init__(self, pool: asyncpg.Pool, api_key: str):
         self.pool = pool
         self.api_key = api_key
+        
+        # 1. 임베딩 단일화: 모든 로직에서 이 객체 사용
         self.embeddings = GoogleGenerativeAIEmbeddings(
             model=settings.gemini_embedding_model,
             google_api_key=api_key
         )
+        
+        # 2. LLM 설정 (스트리밍 최적화)
         self.llm = ChatGoogleGenerativeAI(
             model=settings.gemini_chat_model,
             google_api_key=api_key,
-            temperature=0.7,
+            temperature=0.1,  # 추론 일관성을 위해 낮춤
+            streaming=True
         )
-        logger.info(f"RAG Pipeline initialized with model: {settings.gemini_chat_model}")
-    
-    async def _retrieve_from_db(self, query: str, top_k: int = 3) -> list[RetrievedDoc]:
-        """데이터베이스에서 유사한 문서 검색"""
-        logger.debug(f"Retrieving documents for query: {query[:100]}...")
         
-        # Gemini 임베딩 API를 사용하여 쿼리 임베딩 생성
-        query_response = self.embeddings.embed_query(query)
+        # 3. 청킹 설정 (Recursive: 문맥 보존 최적화)
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len,
+            is_separator_regex=False,
+        )
+        
+        self.message_histories: dict[str, SessionChatMessageHistory] = {}
+
+    def _get_session_history(self, session_id: str) -> SessionChatMessageHistory:
+        if session_id not in self.message_histories:
+            self.message_histories[session_id] = SessionChatMessageHistory(session_id)
+        return self.message_histories[session_id]
+
+    async def ingest_pdf_content(self, title: str, pages: List[Dict[str, Any]]) -> str:
+        """
+        PDF 내용을 청킹하고 배치 임베딩하여 DB에 저장 (성능 최적화)
+        """
+        all_chunks = []
+        
+        # 페이지별 청킹
+        for page in pages:
+            page_num = page["page_num"]
+            text = page["content"]
+            
+            chunks = self.text_splitter.split_text(text)
+            for i, chunk_text in enumerate(chunks):
+                all_chunks.append({
+                    "title": title,
+                    "page_num": page_num,
+                    "chunk_index": i,
+                    "content": chunk_text
+                })
+        
+        if not all_chunks:
+            raise ValueError("추출된 텍스트가 없습니다.")
+
+        # 배치 임베딩 (여러 요청을 하나로 묶어 속도 향상)
+        logger.info(f"Batch embedding {len(all_chunks)} chunks...")
+        texts_to_embed = [c["content"] for c in all_chunks]
+        # aembed_documents를 사용하여 비동기로 한 번에 처리
+        embeddings = await self.embeddings.aembed_documents(texts_to_embed)
+        
+        # DB 벌크 인서트 준비
+        records = []
+        for i, chunk in enumerate(all_chunks):
+            records.append((
+                chunk["title"],
+                chunk["page_num"],
+                chunk["chunk_index"],
+                chunk["content"],
+                embeddings[i]
+            ))
+
+        # DB 저장 (executemany를 통한 고속 저장)
+        sql = """
+            INSERT INTO documents (title, page_num, chunk_index, content, embedding)
+            VALUES ($1, $2, $3, $4, $5)
+        """
+        async with self.pool.acquire() as conn:
+            await conn.executemany(sql, records)
+            # 마지막 ID 조회를 위해 단순 쿼리 하나 더 실행
+            last_id = await conn.fetchval("SELECT id::text FROM documents ORDER BY created_at DESC LIMIT 1")
+            
+        logger.info(f"Successfully ingested {len(all_chunks)} chunks for {title}")
+        return str(last_id)
+
+    async def retrieve(self, query: str, top_k: int = 4) -> list[RetrievedDoc]:
+        """단일 벡터 검색 (경량화 및 임계값 조정)"""
+        # 쿼리 임베딩
+        query_emb = await self.embeddings.aembed_query(query)
+        
+        # 유사도 임계값 하향 (0.72) -> "할아버지 장례식" 등을 더 잘 포착
+        threshold = 0.72 
         
         sql = """
             SELECT id::text, title, page_num, chunk_index, content,
                    (1 - (embedding <=> $1))::float AS similarity
             FROM documents
+            WHERE (1 - (embedding <=> $1)) >= $2
             ORDER BY embedding <=> $1
-            LIMIT $2
+            LIMIT $3
         """
-        
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch(sql, query_response, top_k)
-        
-        logger.debug(f"Retrieved {len(rows)} documents")
+            rows = await conn.fetch(sql, query_emb, threshold, top_k)
         
         return [
             RetrievedDoc(
-                id=r["id"],
-                title=r["title"] or "",
-                page_num=r["page_num"],
-                chunk_index=r["chunk_index"],
-                content=r["content"],
-                similarity=float(r["similarity"]),
-            )
-            for r in rows
+                id=r["id"], title=r["title"] or "",
+                page_num=r["page_num"], chunk_index=r["chunk_index"],
+                content=r["content"], similarity=r["similarity"]
+            ) for r in rows
         ]
-    
-    def _format_docs(self, docs: list[RetrievedDoc]) -> str:
-        """검색된 문서들을 포맷팅"""
-        snippets = []
-        for i, d in enumerate(docs, start=1):
-            title = d.title.strip() or f"문서 {i}"
-            snippets.append(f"[{i}] 제목: {title}\n내용:\n{d.content}".strip())
-        return "\n\n---\n\n".join(snippets)
-    
-    def _format_history(self, history: list[dict] | None) -> str:
-        """대화 히스토리를 포맷팅"""
-        if not history:
-            return ""
-        
-        history_text = "\n이전 대화 내용:\n"
-        for msg in history[-4:]:  # 최근 4개 메시지만 (토큰 절약)
-            role_display = "사용자" if msg.get("role") == "user" else "답변"
-            history_text += f"- {role_display}: {msg.get('content', '')}\n"
-        return history_text + "\n"
-    
-    async def retrieve(self, query: str, top_k: int | None = None) -> list[RetrievedDoc]:
-        """쿼리와 유사한 문서 검색 (공개 메서드)"""
-        k = top_k or settings.top_k
-        return await self._retrieve_from_db(query, k)
-    
-    async def answer_with_rag(
-        self,
-        user_question: str,
-        history: list[dict] | None = None,
-    ) -> tuple[str, str, float | None, list]:
-        """
-        RAG 기반 답변 생성
-        
-        Returns:
-            (answer, mode, similarity, sources) 튜플
-        """
-        logger.info(f"Generating answer for: {user_question[:50]}...")
-        
-        # 문서 검색
-        docs = await self.retrieve(user_question)
-        top_sim = docs[0].similarity if docs else None
-        
-        from .models import SourceInfo
-        
-        if top_sim is not None and top_sim >= settings.similarity_threshold:
-            logger.info(f"Document mode (similarity: {top_sim:.3f})")
-            
-            # 문서 기반 답변
-            context = self._format_docs(docs)
-            history_text = self._format_history(history)
-            
-            prompt_template = ChatPromptTemplate.from_template(
-                """당신은 문서 기반 질의응답 도우미입니다.
-제공된 '참고 문서'의 내용을 바탕으로 사용자의 질문에 답변하세요.
-너무 짧은 단답형은 피하되, 불필요하게 긴 설명은 생략하고 적절한 길이(중간 정도)로 명확하고 친절하게 답변하세요.
-문서에 내용이 없다면 억지로 지어내지 말고 '문서에서 관련 내용을 찾을 수 없습니다'라고 답변하세요.
 
-{history}{context}
-
-사용자의 현재 질문:
-{question}
-
-답변:"""
-            )
-            
-            # LCEL 체인 구성
-            chain = (
-                {
-                    "context": RunnableLambda(lambda _: context),
-                    "history": RunnableLambda(lambda _: history_text),
-                    "question": RunnablePassthrough(),
-                }
-                | prompt_template
-                | self.llm
-            )
-            
-            # 비동기 실행
-            response = await chain.ainvoke(user_question)
-            body = response.content
-            
-            sources = [
-                SourceInfo(
-                    title=d.title,
-                    page_num=d.page_num,
-                    similarity=d.similarity,
-                    snippet=d.snippet
-                )
-                for d in docs
-            ]
-            
-            return f"[문서 참조 답변]\n{body}".strip(), "document", top_sim, sources
-        
-        else:
-            logger.info("Gemini mode (no similar documents found)")
-            
-            # Gemini 기본 모드 답변
-            history_text = self._format_history(history)
-            
-            prompt_template = ChatPromptTemplate.from_template(
-                """당신은 유용하고 정확한 한국어 AI 도우미입니다.
-사용자의 질문에 친절하고 명확하게 답변하세요. 너무 짧은 단답 형식은 피하고, 핵심 내용을 이해하기 쉽게 2~3문단 정도의 적절한 길이로 설명해 주세요.
-이전 대화의 맥락을 고려하여 일관성 있게 답변하세요.
-
-{history}사용자의 현재 질문:
-{question}
-
-답변:"""
-            )
-            
-            chain = (
-                {
-                    "history": RunnableLambda(lambda _: history_text),
-                    "question": RunnablePassthrough(),
-                }
-                | prompt_template
-                | self.llm
-            )
-            
-            response = await chain.ainvoke(user_question)
-            body = response.content
-            
-            return f"[Gemini 추론 답변]\n{body}".strip(), "gemini", top_sim, []
-    
     async def answer_with_rag_stream(
-        self,
-        user_question: str,
-        history: list[dict] | None = None,
+        self, user_question: str, session_id: str = "default"
     ) -> AsyncGenerator[dict, None]:
-        """
-        RAG 기반 스트리밍 답변 생성
+        """RAG 스트리밍 답변 (엄격한 프롬프트 적용)"""
         
-        Yields:
-            스트리밍 청크 (메타데이터 또는 텍스트)
-        """
-        logger.info(f"Starting stream for: {user_question[:50]}...")
-        
-        from .models import SourceInfo
-        
-        # 문서 검색
+        # 1. 문서 검색
         docs = await self.retrieve(user_question)
         top_sim = docs[0].similarity if docs else None
         
-        if top_sim is not None and top_sim >= settings.similarity_threshold:
-            logger.info(f"Stream: Document mode (similarity: {top_sim:.3f})")
-            
+        history_obj = self._get_session_history(session_id)
+        # 최근 3개 대화만 유지 (프롬프트 팽창 방지)
+        recent_history = history_obj.messages[-3:] if len(history_obj.messages) > 0 else []
+        
+        if top_sim and top_sim >= 0.72:
             mode = "document"
-            context = self._format_docs(docs)
-            history_text = self._format_history(history)
-            
-            sources = [
-                {
-                    "title": d.title,
-                    "page_num": d.page_num,
-                    "similarity": d.similarity,
-                    "snippet": d.snippet
-                }
-                for d in docs
-            ]
+            context = "\n\n".join([f"[{i+1}] {d.content}" for i, d in enumerate(docs)])
             
             # 메타데이터 전송
             yield {
-                "type": "metadata",
-                "mode": mode,
-                "similarity": float(top_sim),
-                "sources": sources,
+                "type": "metadata", "mode": mode, "similarity": top_sim,
+                "sources": [{"title": d.title, "page_num": d.page_num, "similarity": d.similarity, "snippet": d.snippet} for d in docs]
             }
+
+            # 2. 시스템 프롬프트 (추론 강화 및 문서 기반 엄격화)
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", """당신은 회사의 규정 및 매뉴얼 전문가입니다. 
+제공된 [참고 문서]를 바탕으로 질문에 답하세요.
+
+[답변 지침]
+1. 사용자의 질문 의도를 파악하세요. (예: "할아버지 장례" -> "경조 휴가 - 조부모상" 관련 내용 찾기)
+2. 반드시 [참고 문서]에 근거하여 답변하고, 문서에 없는 내용은 "관련 규정을 찾을 수 없습니다"라고 답하세요.
+3. 문서 내용을 임의로 지어내지 마세요(환각 방지).
+4. 답변은 친절한 한국어로 작성하세요.
+
+[참고 문서]
+{context}"""),
+                MessagesPlaceholder(variable_name="history"),
+                ("human", "{input}"),
+            ])
             
-            prompt_template = ChatPromptTemplate.from_template(
-                """당신은 문서 기반 질의응답 도우미입니다.
-제공된 '참고 문서'의 내용을 바탕으로 사용자의 질문에 답변하세요.
-너무 짧은 단답형은 피하되, 불필요하게 긴 설명은 생략하고 적절한 길이(중간 정도)로 명확하고 친절하게 답변하세요.
-문서에 내용이 없다면 억지로 지어내지 말고 '문서에서 관련 내용을 찾을 수 없습니다'라고 답변하세요.
-
-{history}{context}
-
-사용자의 현재 질문:
-{question}
-
-답변:"""
-            )
-            
-            chain = (
-                {
-                    "context": RunnableLambda(lambda _: context),
-                    "history": RunnableLambda(lambda _: history_text),
-                    "question": RunnablePassthrough(),
-                }
-                | prompt_template
-                | self.llm
-            )
+            chain = prompt | self.llm
+            history_obj.add_message(HumanMessage(content=user_question))
             
             yield {"type": "prefix", "text": "[문서 참조 답변]\n"}
             
-            # 스트리밍
-            async for chunk in chain.astream(user_question):
+            full_answer = ""
+            async for chunk in chain.astream({"input": user_question, "context": context, "history": recent_history}):
                 if chunk.content:
+                    full_answer += chunk.content
                     yield {"type": "chunk", "text": chunk.content}
             
-            logger.info("Stream completed (document mode)")
-        
+            history_obj.add_message(AIMessage(content=full_answer))
+            
         else:
-            logger.info("Stream: Gemini mode")
-            
+            # 일반 모드
             mode = "gemini"
-            history_text = self._format_history(history)
+            yield {"type": "metadata", "mode": mode, "similarity": None, "sources": []}
             
-            # 메타데이터 전송
-            yield {
-                "type": "metadata",
-                "mode": mode,
-                "similarity": None,
-                "sources": [],
-            }
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", "당신은 유능한 AI 어시스턴트입니다. 친절하고 정확하게 한국어로 답변하세요."),
+                MessagesPlaceholder(variable_name="history"),
+                ("human", "{input}"),
+            ])
             
-            prompt_template = ChatPromptTemplate.from_template(
-                """당신은 유용하고 정확한 한국어 AI 도우미입니다.
-사용자의 질문에 친절하고 명확하게 답변하세요. 너무 짧은 단답 형식은 피하고, 핵심 내용을 이해하기 쉽게 2~3문단 정도의 적절한 길이로 설명해 주세요.
-이전 대화의 맥락을 고려하여 일관성 있게 답변하세요.
-
-{history}사용자의 현재 질문:
-{question}
-
-답변:"""
-            )
+            chain = prompt | self.llm
+            history_obj.add_message(HumanMessage(content=user_question))
             
-            chain = (
-                {
-                    "history": RunnableLambda(lambda _: history_text),
-                    "question": RunnablePassthrough(),
-                }
-                | prompt_template
-                | self.llm
-            )
+            yield {"type": "prefix", "text": "[AI 추론 답변]\n"}
             
-            yield {"type": "prefix", "text": "[Gemini 추론 답변]\n"}
-            
-            # 스트리밍
-            async for chunk in chain.astream(user_question):
+            full_answer = ""
+            async for chunk in chain.astream({"input": user_question, "history": recent_history}):
                 if chunk.content:
+                    full_answer += chunk.content
                     yield {"type": "chunk", "text": chunk.content}
             
-            logger.info("Stream completed (gemini mode)")
+            history_obj.add_message(AIMessage(content=full_answer))

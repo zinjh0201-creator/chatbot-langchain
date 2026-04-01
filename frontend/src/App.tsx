@@ -85,12 +85,19 @@ export default function App() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
   }, [messages]);
 
+  // useEffect(() => {
+  //   listRef.current?.scrollTo({
+  //     top: listRef.current.scrollHeight,
+  //     behavior: "smooth",
+  //   });
+  // }, [messages.length, pending]);
+
+  // 메시지 내용(text)이 변할 때마다(스트리밍 중) 스크롤을 맨 아래로 내립니다.
   useEffect(() => {
-    listRef.current?.scrollTo({
-      top: listRef.current.scrollHeight,
-      behavior: "smooth",
-    });
-  }, [messages.length, pending]);
+    if (listRef.current) {
+      listRef.current.scrollTop = listRef.current.scrollHeight;
+    }
+  }, [messages, pending]); // messages 객체 자체가 변할 때마다 실행
 
   const showToast = useCallback(
     (text: string, type: "success" | "error" = "success") => {
@@ -173,6 +180,164 @@ export default function App() {
     [input, pending],
   );
 
+  // async function send() {
+  //   const text = input.trim();
+  //   if (!text || pending) return;
+
+  //   if (backendStatus === "offline") {
+  //     showToast(
+  //       "현재 서버에 연결할 수 없습니다. 잠시 후 다시 시도해 주세요.",
+  //       "error",
+  //     );
+  //     return;
+  //   }
+
+  //   setInput("");
+  //   const userMsg: ChatMessage = { id: uid(), role: "user", text };
+  //   setMessages((m) => [...m, userMsg]);
+
+  //   setPending(true);
+  //   try {
+  //     console.log("[Chat] Sending message:", text);
+
+  //     // 대화 히스토리 구성 (현재 메시지 제외)
+  //     const history = messages.map((m) => ({
+  //       role: m.role,
+  //       content: m.text,
+  //     }));
+
+  //     // 스트리밍 엔드포인트 사용
+  //     const res = await fetch(`${API_BASE}/chat-stream`, {
+  //       method: "POST",
+  //       headers: { "Content-Type": "application/json" },
+  //       body: JSON.stringify({ message: text, history }),
+  //     });
+  //     console.log("[Chat] Response status:", res.status, res.ok);
+  //     if (!res.ok) {
+  //       const detail = await res.text();
+  //       const errorMsg = detail || `HTTP ${res.status}`;
+  //       console.error("[Chat] HTTP Error:", errorMsg);
+  //       throw new Error(errorMsg);
+  //     }
+
+  //     // ReadableStream으로 스트리밍 처리 (Server-Sent Events)
+  //     if (!res.body) {
+  //       throw new Error("Response body is null");
+  //     }
+
+  //     const reader = res.body.getReader();
+  //     const decoder = new TextDecoder();
+  //     let buffer = "";
+  //     let assistantMsgId = uid();
+  //     let assistantText = "";
+  //     let metadata: {
+  //       mode?: ChatMode;
+  //       similarity?: number | null;
+  //       sources?: SourceInfo[];
+  //     } = {};
+  //     let hasMetadata = false;
+
+  //     try {
+  //       while (true) {
+  //         const { done, value } = await reader.read();
+  //         if (done) break;
+
+  //         // 청크를 디코딩하고 버퍼에 누적
+  //         buffer += decoder.decode(value, { stream: true });
+
+  //         // SSE 포맷: "data: {...json...}\n\n"로 구분됨
+  //         // \n\n이 이벤트 경계
+  //         const events = buffer.split("\n\n");
+  //         buffer = events[events.length - 1]; // 마지막 불완전한 이벤트는 버퍼에 유지
+
+  //         for (let i = 0; i < events.length - 1; i++) {
+  //           const event = events[i].trim();
+  //           if (!event) continue;
+
+  //           try {
+  //             // SSE 포맷: "data: {...json...}"
+  //             if (event.startsWith("data: ")) {
+  //               const jsonStr = event.substring(6); // "data: " 제거
+  //               const chunk = JSON.parse(jsonStr);
+
+  //               if (chunk.type === "metadata") {
+  //                 // 메타데이터 수신
+  //                 metadata = {
+  //                   mode: chunk.mode,
+  //                   similarity: chunk.similarity,
+  //                   sources: chunk.sources,
+  //                 };
+  //                 hasMetadata = true;
+  //                 console.log("[Chat] Metadata received:", metadata);
+  //               } else if (chunk.type === "prefix") {
+  //                 // 프리픽스 (예: "[문서 참조 답변]\n")
+  //                 assistantText += chunk.text;
+  //               } else if (chunk.type === "chunk") {
+  //                 // 텍스트 청크 - UI에 즉시 반영
+  //                 assistantText += chunk.text;
+
+  //                 // 실시간 업데이트
+  //                 setMessages((m) => {
+  //                   const lastMsg = m[m.length - 1];
+  //                   if (lastMsg?.id === assistantMsgId) {
+  //                     return [
+  //                       ...m.slice(0, -1),
+  //                       {
+  //                         ...lastMsg,
+  //                         text: assistantText,
+  //                         meta: hasMetadata ? metadata : undefined,
+  //                       },
+  //                     ];
+  //                   } else {
+  //                     return m;
+  //                   }
+  //                 });
+  //               }
+  //             }
+  //           } catch (e) {
+  //             console.warn("[Chat] Failed to parse SSE event:", event, e);
+  //           }
+  //         }
+  //       }
+  //     } finally {
+  //       reader.releaseLock();
+  //     }
+
+  //     // 스트리밍 완료 시 최종 메시지 설정
+  //     const assistantMsg: ChatMessage = {
+  //       id: assistantMsgId,
+  //       role: "assistant",
+  //       text: assistantText,
+  //       meta: hasMetadata ? metadata : undefined,
+  //     };
+
+  //     setMessages((m) => {
+  //       const lastMsg = m[m.length - 1];
+  //       if (lastMsg?.id === assistantMsgId) {
+  //         return m; // 이미 업데이트됨
+  //       } else {
+  //         return [...m, assistantMsg];
+  //       }
+  //     });
+
+  //     setBackendStatus("online");
+  //     console.log("[Chat] Stream completed successfully");
+  //   } catch (e) {
+  //     setBackendStatus("offline");
+  //     const errorMsg = e instanceof Error ? e.message : String(e);
+  //     console.error("[Chat] Network Error:", errorMsg, e);
+  //     showToast(`답변 요청 중 오류: ${errorMsg}`, "error");
+  //     const errorChatMsg: ChatMessage = {
+  //       id: uid(),
+  //       role: "assistant",
+  //       text: `[오류]\n${errorMsg}`,
+  //     };
+  //     setMessages((m) => [...m, errorChatMsg]);
+  //   } finally {
+  //     setPending(false);
+  //   }
+  // }
+
   async function send() {
     const text = input.trim();
     if (!text || pending) return;
@@ -192,14 +357,15 @@ export default function App() {
     setPending(true);
     try {
       console.log("[Chat] Sending message:", text);
-      
+
       // 대화 히스토리 구성 (현재 메시지 제외)
       const history = messages.map((m) => ({
         role: m.role,
         content: m.text,
       }));
-      
-      const res = await fetch(`${API_BASE}/chat`, {
+
+      // 스트리밍 엔드포인트 사용
+      const res = await fetch(`${API_BASE}/chat-stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: text, history }),
@@ -211,20 +377,116 @@ export default function App() {
         console.error("[Chat] HTTP Error:", errorMsg);
         throw new Error(errorMsg);
       }
-      const data = (await res.json()) as ChatResponse;
+
+      // ReadableStream으로 스트리밍 처리 (Server-Sent Events)
+      if (!res.body) {
+        throw new Error("Response body is null");
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let assistantMsgId = uid();
+      let assistantText = "";
+      let metadata: {
+        mode?: ChatMode;
+        similarity?: number | null;
+        sources?: SourceInfo[];
+      } = {};
+      let hasMetadata = false;
+
+      // 🔥 [여기가 추가된 핵심 코드입니다] 🔥
+      // 스트리밍 루프에 들어가기 직전에, AI의 빈 말풍선을 화면에 먼저 만들어 줍니다.
+      setMessages((m) => [
+        ...m,
+        { id: assistantMsgId, role: "assistant", text: "" },
+      ]);
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          // 청크를 디코딩하고 버퍼에 누적
+          buffer += decoder.decode(value, { stream: true });
+
+          // SSE 포맷: "data: {...json...}\n\n"로 구분됨
+          // \n\n이 이벤트 경계
+          const events = buffer.split("\n\n");
+          buffer = events[events.length - 1]; // 마지막 불완전한 이벤트는 버퍼에 유지
+
+          for (let i = 0; i < events.length - 1; i++) {
+            const event = events[i].trim();
+            if (!event) continue;
+
+            try {
+              // SSE 포맷: "data: {...json...}"
+              if (event.startsWith("data: ")) {
+                const jsonStr = event.substring(6); // "data: " 제거
+                const chunk = JSON.parse(jsonStr);
+
+                if (chunk.type === "metadata") {
+                  // 메타데이터 수신
+                  metadata = {
+                    mode: chunk.mode,
+                    similarity: chunk.similarity,
+                    sources: chunk.sources,
+                  };
+                  hasMetadata = true;
+                  console.log("[Chat] Metadata received:", metadata);
+                } else if (chunk.type === "prefix") {
+                  // 프리픽스 (예: "[문서 참조 답변]\n")
+                  assistantText += chunk.text;
+                } else if (chunk.type === "chunk") {
+                  // 텍스트 청크 - UI에 즉시 반영
+                  assistantText += chunk.text;
+
+                  // 실시간 업데이트 (이제 빈 말풍선이 있으므로 정상 작동합니다!)
+                  setMessages((m) => {
+                    const lastMsg = m[m.length - 1];
+                    if (lastMsg?.id === assistantMsgId) {
+                      return [
+                        ...m.slice(0, -1),
+                        {
+                          ...lastMsg,
+                          text: assistantText,
+                          meta: hasMetadata ? metadata : undefined,
+                        },
+                      ];
+                    } else {
+                      return m;
+                    }
+                  });
+                }
+              }
+            } catch (e) {
+              console.warn("[Chat] Failed to parse SSE event:", event, e);
+            }
+          }
+        }
+      } finally {
+        reader.releaseLock();
+      }
+
+      // 스트리밍 완료 시 최종 메시지 설정
       const assistantMsg: ChatMessage = {
-        id: uid(),
+        id: assistantMsgId,
         role: "assistant",
-        text: data.answer,
-        meta: {
-          mode: data.mode,
-          similarity: data.similarity ?? null,
-          sources: data.sources ?? [],
-        },
+        text: assistantText,
+        meta: hasMetadata ? metadata : undefined,
       };
-      setMessages((m) => [...m, assistantMsg]);
+
+      setMessages((m) => {
+        const lastMsg = m[m.length - 1];
+        if (lastMsg?.id === assistantMsgId) {
+          return m; // 이미 업데이트됨
+        } else {
+          return [...m, assistantMsg];
+        }
+      });
+
       setBackendStatus("online");
-      console.log("[Chat] Message completed successfully");
+      console.log("[Chat] Stream completed successfully");
     } catch (e) {
       setBackendStatus("offline");
       const errorMsg = e instanceof Error ? e.message : String(e);
@@ -240,7 +502,6 @@ export default function App() {
       setPending(false);
     }
   }
-
   const uploadPdf = useCallback(
     async (file: File) => {
       if (backendStatus === "offline") {
@@ -516,10 +777,91 @@ export default function App() {
               </div>
             </div>
           ) : (
+            //     messages.map((m) => (
+            //       <div key={m.id} className={`msgRow ${m.role}`}>
+            //         <div className="msgBubble">
+            //           <pre className="msgText">{m.text}</pre>
+            //           {m.role === "assistant" && m.meta?.mode ? (
+            //             <div className="meta">
+            //               <span className={`badge ${m.meta.mode}`}>
+            //                 {m.meta.mode === "document"
+            //                   ? "🎯 문서 참조"
+            //                   : "✨ AI 추론"}
+            //               </span>
+            //               {typeof m.meta.similarity === "number" ? (
+            //                 <span className="sim">
+            //                   정확도: {(m.meta.similarity * 100).toFixed(1)}%
+            //                 </span>
+            //               ) : null}
+            //               {m.meta.sources && m.meta.sources.length > 0 ? (
+            //                 <details className="sources">
+            //                   <summary>💡 근거 출처 보기</summary>
+            //                   <ul>
+            //                     {m.meta.sources.map((s, idx) => (
+            //                       <li key={idx} className="source-item">
+            //                         <div className="source-header">
+            //                           <strong>{s.title}</strong>
+            //                           <span className="page-badge">
+            //                             p. {s.page_num}
+            //                           </span>
+            //                           <span className="similarity-badge">
+            //                             {(s.similarity * 100).toFixed(0)}% 유사
+            //                           </span>
+            //                         </div>
+            //                         <div className="source-snippet">
+            //                           "{s.snippet}"
+            //                         </div>
+            //                       </li>
+            //                     ))}
+            //                   </ul>
+            //                 </details>
+            //               ) : null}
+            //             </div>
+            //           ) : null}
+            //         </div>
+            //         <button
+            //           type="button"
+            //           className="msgCopyBtn"
+            //           title="복사"
+            //           onClick={() => {
+            //             const textToCopy =
+            //               m.role === "assistant"
+            //                 ? getAnswerTextOnly(m.text)
+            //                 : m.text;
+            //             copyToClipboard(textToCopy);
+            //           }}
+            //         >
+            //           📋
+            //         </button>
+            //       </div>
+            //     ))
+            //   )}
+            //   {pending && (
+            //     <div className="msgRow assistant">
+            //       <div className="msgBubble">
+            //         <div className="typing">
+            //           <span className="t" />
+            //           <span className="t" />
+            //           <span className="t" />
+            //         </div>
+            //       </div>
+            //     </div>
+            //   )}
+            // </div>
             messages.map((m) => (
               <div key={m.id} className={`msgRow ${m.role}`}>
                 <div className="msgBubble">
-                  <pre className="msgText">{m.text}</pre>
+                  {/* 🔥 수정 포인트 1: 텍스트가 비어있는 assistant 메시지일 때만 로딩 애니메이션 표시 */}
+                  {m.role === "assistant" && m.text === "" ? (
+                    <div className="typing">
+                      <span className="t" />
+                      <span className="t" />
+                      <span className="t" />
+                    </div>
+                  ) : (
+                    <pre className="msgText">{m.text}</pre>
+                  )}
+
                   {m.role === "assistant" && m.meta?.mode ? (
                     <div className="meta">
                       <span className={`badge ${m.meta.mode}`}>
@@ -527,6 +869,7 @@ export default function App() {
                           ? "🎯 문서 참조"
                           : "✨ AI 추론"}
                       </span>
+                      {/* ... (기존 similarity 및 sources 코드는 그대로 유지) ... */}
                       {typeof m.meta.similarity === "number" ? (
                         <span className="sim">
                           정확도: {(m.meta.similarity * 100).toFixed(1)}%
@@ -575,17 +918,8 @@ export default function App() {
               </div>
             ))
           )}
-          {pending && (
-            <div className="msgRow assistant">
-              <div className="msgBubble">
-                <div className="typing">
-                  <span className="t" />
-                  <span className="t" />
-                  <span className="t" />
-                </div>
-              </div>
-            </div>
-          )}
+          {/* 🔥 수정 포인트 2: 기존의 별도 pending 블록은 삭제합니다. 
+              위에서 m.text === "" 인 말풍선이 이미 로딩바 역할을 수행하기 때문입니다. */}
         </div>
 
         <div className="composerWrapper">
