@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class RetrievedDoc:
-    """검색된 문서 정보"""
+    """DB에서 검색된 개별 문서 조각 정보를 담는 객체"""
     id: str
     title: str
     page_num: int
@@ -39,11 +39,12 @@ class RetrievedDoc:
 
     @property
     def snippet(self) -> str:
+        """UI 표시용 요약 텍스트 (앞부분 200자)"""
         text = self.content.strip()
         return text[:200] + "..." if len(text) > 200 else text
 
 class SessionChatMessageHistory(BaseChatMessageHistory):
-    """세션 기반 대화 히스토리 (메모리 저장소)"""
+    """세션별로 대화 이력을 메모리에 저장하는 클래스 (멀티턴 대화 지원)"""
     def __init__(self, session_id: str):
         self.session_id = session_id
         self.messages: list[BaseMessage] = []
@@ -55,17 +56,18 @@ class SessionChatMessageHistory(BaseChatMessageHistory):
         self.messages.clear()
 
 class SupabaseRAGPipeline:
+    """사내 규정 RAG 시스템의 핵심 파이프라인 클래스"""
     def __init__(self, pool: asyncpg.Pool, api_key: str):
         self.pool = pool
         self.api_key = api_key
 
-        # 1. 임베딩 단일화
+        # 1. 임베딩 모델 설정: 텍스트를 벡터로 변환 (Google Gemini Embedding)
         self.embeddings = GoogleGenerativeAIEmbeddings(
             model=settings.gemini_embedding_model,
             google_api_key=api_key
         )
 
-        # 2. 의도 추론 전용 (비스트리밍, 엄격)
+        # 2. 의도 추론 LLM: 질문의 핵심 키워드를 뽑는 용도 (엄격한 결과 추출을 위해 temperature=0)
         self.intent_llm = ChatGoogleGenerativeAI(
             model=settings.gemini_chat_model,
             google_api_key=api_key,
@@ -73,7 +75,7 @@ class SupabaseRAGPipeline:
             streaming=False
         )
 
-        # 3. 답변 생성용 (스트리밍)
+        # 3. 답변 생성용 LLM: 최종 답변을 문장으로 생성하는 용도 (약간의 유연성을 위해 temperature=0.2)
         self.answer_llm = ChatGoogleGenerativeAI(
             model=settings.gemini_chat_model,
             google_api_key=api_key,
@@ -81,7 +83,7 @@ class SupabaseRAGPipeline:
             streaming=True
         )
 
-        # 4. 청킹 설정
+        # 4. 청킹 설정: PDF 내용을 일정 크기로 자르는 설정
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=200,
@@ -91,31 +93,34 @@ class SupabaseRAGPipeline:
         self.message_histories: dict[str, SessionChatMessageHistory] = {}
 
     def _get_session_history(self, session_id: str) -> SessionChatMessageHistory:
+        """세션 ID에 해당하는 대화 이력을 가져오거나 새로 생성"""
         if session_id not in self.message_histories:
             self.message_histories[session_id] = SessionChatMessageHistory(session_id)
         return self.message_histories[session_id]
-
+    # [Step 1] 질문 의도 추론: 사용자의 모호한 질문을 DB 검색에 유리한 공식 키워드로 변환
     async def _infer_intent_and_rewrite(self, query: str) -> str:
         """사용자의 질문에서 검색 의도를 정확히 추출 (XML 태그로 출력 강제)"""
         prompt = ChatPromptTemplate.from_messages([
-            ("system", """당신은 인사 규정 검색 전문가입니다. 
-사용자의 모호한 질문 뒤에 숨겨진 '검색 의도'를 파악하여 최적의 검색 키워드 3~4개를 생성하세요.
+            ("system", """당신은 사내 인사 규정 검색을 위한 냉철한 키워드 추출기입니다.
+사용자의 질문 내용(출산, 질병, 경조사 등)에 절대 감정적으로 동요하거나 공감하지 마세요. 축하, 위로, 인사말, 설명은 엄격히 금지됩니다.
+오직 사내 규정 DB에서 검색할 공식 키워드 3~4개만 추출하세요.
 
 [출력 규칙]
-1. 반드시 <intent>키워드1, 키워드2, ...</intent> 형식으로 답변하세요.
-2. 친절한 말이나 인사말을 절대 덧붙이지 마세요.
-3. 오직 검색에 필요한 단어만 추출하세요.
+1. 반드시 <intent>키워드1, 키워드2, ...</intent> 형식으로만 답변하세요.
+2. 태그 밖에는 어떠한 텍스트도 절대 출력하지 마세요.
 
 [예시]
-- 질문: "아 오늘 컨디션이 별로인데 어떡하지" -> <intent>병가 규정, 연차 신청, 유급 휴가, 질병 휴직</intent>
-- 질문: "휴가 쓰고 싶은데 언제까지 말해야 돼?" -> <intent>연차 신청 기한, 휴가 승인 절차, 사전 통지 규정</intent>"""),
+- 질문: "아 오늘 컨디션이 별로인데 어떡하지" -> <intent>병가 규정, 연차 신청, 유급 휴가</intent>
+- 질문: "나 어제 출산했는데 회사는 어떡해?" -> <intent>산전후 휴가, 출산 휴가, 모성 보호, 유급 휴일</intent>
+- 질문: "가족이 돌아가셨어..." -> <intent>경조사 휴가, 청원 휴가, 장례 지원</intent>"""),
             ("human", "{input}")
         ])
         chain = prompt | self.intent_llm
         try:
             response = await chain.ainvoke({"input": query})
             content = response.content.strip()
-            # XML 태그 내의 내용만 추출
+
+            # 정규표현식을 사용하여 <intent> 태그 내부의 키워드만 추출 (LLM의 불필요한 서술 방지)
             import re
             match = re.search(r"<intent>(.*?)</intent>", content, re.DOTALL)
             rewritten = match.group(1).strip() if match else content
@@ -125,11 +130,15 @@ class SupabaseRAGPipeline:
             logger.warning(f"Intent inference failed: {e}")
             return query
 
+    # [Step 2] 문서 검색: 추론된 키워드를 바탕으로 DB(Supabase/pgvector)에서 관련 조항 탐색
     async def retrieve(self, query: str, top_k: int = 5) -> list[RetrievedDoc]:
         """추론된 의도를 바탕으로 문서 검색"""
+        # 의도 추론된 키워드 획득
         search_query = await self._infer_intent_and_rewrite(query)
+        # 키워드를 벡터로 변환
         query_emb = await self.embeddings.aembed_query(search_query)
 
+        # 유사도 0.65 이상인 문서를 최대 top_k개 가져옴 (0.65는 검색 범위를 넓히기 위한 수치)
         threshold = 0.65
         sql = """
             SELECT id::text, title, page_num, chunk_index, content,
@@ -143,27 +152,34 @@ class SupabaseRAGPipeline:
         return [RetrievedDoc(id=r["id"], title=r["title"] or "", page_num=r["page_num"], 
                              chunk_index=r["chunk_index"], content=r["content"], similarity=r["similarity"]) for r in rows]
 
+    # [Step 3] 조건부 답변 생성: 검색 결과가 있으면 '문서 기반', 없으면 '일반 상식' 답변 제공
     async def answer_with_rag_stream(
         self, user_question: str, session_id: str = "default"
     ) -> AsyncGenerator[dict, None]:
-        """최종 답변 생성 파이프라인"""
+        """최종 답변 생성 파이프라인 (스트리밍 방식)"""
         
+        # 문서 검색 수행
         docs = await self.retrieve(user_question)
+        # 검색된 문서 중 가장 높은 유사도 확인
         top_sim = docs[0].similarity if docs else 0.0
         
+        # 세션별 대화 이력 로드 (최근 5개 메시지 유지)
         history_obj = self._get_session_history(session_id)
         recent_history = history_obj.messages[-5:]
 
-        # [1] 문서 기반 답변 (Document First)
+        # [분기 A] 검색된 문서의 유사도가 0.72 이상일 때 (확실한 규정이 있을 때)
         if top_sim >= 0.72:
             mode = "document"
+            # 검색된 모든 조항을 하나의 텍스트 컨텍스트로 결합
             context = "\n\n".join([f"[{i+1}] 출처: {d.title} (p.{d.page_num})\n내용: {d.content}" for i, d in enumerate(docs)])
             
+            # 프론트엔드에 검색 메타데이터 먼저 전송
             yield {
                 "type": "metadata", "mode": mode, "similarity": top_sim,
                 "sources": [{"title": d.title, "page_num": d.page_num, "similarity": d.similarity, "snippet": d.snippet} for d in docs]
             }
 
+            # 엄격한 규정 준수 프롬프트 설정 (외부 지식 차단)
             prompt = ChatPromptTemplate.from_messages([
                 ("system", """당신은 회사의 **엄격한 인사 규정 전문가**입니다. 
 제공된 [사내 규정 컨텍스트]에만 100% 근거하여 답변하세요. 
@@ -186,13 +202,16 @@ class SupabaseRAGPipeline:
             yield {"type": "prefix", "text": "[사내 규정 기반 답변]\n"}
             
             full_answer = ""
+            # LLM 응답을 실시간 조각(chunk)으로 클라이언트에 전송
             async for chunk in chain.astream({"input": user_question, "context": context, "history": recent_history}):
                 if chunk.content:
                     full_answer += chunk.content
                     yield {"type": "chunk", "text": chunk.content}
+            
+            # 최종 AI 답변을 히스토리에 저장
             history_obj.add_message(AIMessage(content=full_answer))
 
-        # [2] 일반 상식 기반 답변 (Fallback)
+        # [분기 B] 검색 결과가 없거나 불확실할 때 (일반 상식 Fallback)
         else:
             mode = "fallback"
             yield {"type": "metadata", "mode": mode, "similarity": top_sim, "sources": []}
