@@ -1,35 +1,41 @@
 """
-LangChain 기반 RAG (Retrieval-Augmented Generation) 핵심 파이프라인
+LangChain 기반 RAG 핵심 파이프라인 - 리팩토링 v2
 
-리팩토링 사항:
-1. 임베딩 로직 단일화 (LangChain 객체 사용)
-2. 고성능 청킹 (RecursiveCharacterTextSplitter)
-3. 배치 임베딩 및 벌크 인서트 (속도 향상)
-4. 검색 로직 경량화 및 프롬프트 고도화 (환각 방지)
+수정 사항:
+1. [핵심 버그 수정] search_query를 답변 생성 프롬프트에도 전달 (검색-생성 단절 해소)
+2. [분기 로직 수정] top_sim 0.72 기준 제거 → if docs: 로 단순화
+3. [프롬프트 강화] 영어 ABSOLUTE_RULES + XML 구조화 컨텍스트 + 인용 강제
+4. [Answerability Judge 추가] 문서가 있어도 답변 가능 여부를 별도 판정
+5. [답변 포맷 강제] 결론/근거/조건 구조로 LLM 상식 서술 공간 제거
+6. [히스토리 오염 방지] fallback 진입 조건 명확화
 """
 
 from __future__ import annotations
 
+import re
 import asyncpg
 import logging
-import json
-from typing import AsyncGenerator, List, Dict, Any
+from typing import AsyncGenerator
 from dataclasses import dataclass
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables import RunnablePassthrough, RunnableLambda
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langchain_core.chat_history import BaseChatMessageHistory
 
 from .config import settings
 
 logger = logging.getLogger(__name__)
 
+
+# ──────────────────────────────────────────────
+# 데이터 클래스
+# ──────────────────────────────────────────────
+
 @dataclass(frozen=True)
 class RetrievedDoc:
-    """DB에서 검색된 개별 문서 조각 정보를 담는 객체"""
+    """검색된 문서 정보"""
     id: str
     title: str
     page_num: int
@@ -39,12 +45,18 @@ class RetrievedDoc:
 
     @property
     def snippet(self) -> str:
-        """UI 표시용 요약 텍스트 (앞부분 200자)"""
-        text = self.content.strip()
+        # ★ 핵심 수정: 숨겨진 줄바꿈(\n)과 연속된 공백을 하나의 띄어쓰기로 압축(다림질)
+        import re
+        text = re.sub(r'\s+', ' ', self.content.strip())
         return text[:200] + "..." if len(text) > 200 else text
 
+
+# ──────────────────────────────────────────────
+# 세션 히스토리
+# ──────────────────────────────────────────────
+
 class SessionChatMessageHistory(BaseChatMessageHistory):
-    """세션별로 대화 이력을 메모리에 저장하는 클래스 (멀티턴 대화 지원)"""
+    """세션 기반 대화 히스토리 (메모리 저장소)"""
     def __init__(self, session_id: str):
         self.session_id = session_id
         self.messages: list[BaseMessage] = []
@@ -55,19 +67,22 @@ class SessionChatMessageHistory(BaseChatMessageHistory):
     def clear(self) -> None:
         self.messages.clear()
 
+
+# ──────────────────────────────────────────────
+# 메인 파이프라인
+# ──────────────────────────────────────────────
+
 class SupabaseRAGPipeline:
-    """사내 규정 RAG 시스템의 핵심 파이프라인 클래스"""
     def __init__(self, pool: asyncpg.Pool, api_key: str):
         self.pool = pool
         self.api_key = api_key
 
-        # 1. 임베딩 모델 설정: 텍스트를 벡터로 변환 (Google Gemini Embedding)
         self.embeddings = GoogleGenerativeAIEmbeddings(
             model=settings.gemini_embedding_model,
             google_api_key=api_key
         )
 
-        # 2. 의도 추론 LLM: 질문의 핵심 키워드를 뽑는 용도 (엄격한 결과 추출을 위해 temperature=0)
+        # 의도 추론 / answerability 판정용 (비스트리밍, 엄격)
         self.intent_llm = ChatGoogleGenerativeAI(
             model=settings.gemini_chat_model,
             google_api_key=api_key,
@@ -75,15 +90,14 @@ class SupabaseRAGPipeline:
             streaming=False
         )
 
-        # 3. 답변 생성용 LLM: 최종 답변을 문장으로 생성하는 용도 (약간의 유연성을 위해 temperature=0.2)
+        # 답변 생성용 (스트리밍)
         self.answer_llm = ChatGoogleGenerativeAI(
             model=settings.gemini_chat_model,
             google_api_key=api_key,
-            temperature=0.2,
+            temperature=0.1,   # 0.2 → 0.1: 더 보수적으로 (상식 혼합 억제)
             streaming=True
         )
 
-        # 4. 청킹 설정: PDF 내용을 일정 크기로 자르는 설정
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=200,
@@ -92,149 +106,345 @@ class SupabaseRAGPipeline:
 
         self.message_histories: dict[str, SessionChatMessageHistory] = {}
 
+    # ────────────────────────────
+    # 히스토리 관리
+    # ────────────────────────────
+
     def _get_session_history(self, session_id: str) -> SessionChatMessageHistory:
-        """세션 ID에 해당하는 대화 이력을 가져오거나 새로 생성"""
         if session_id not in self.message_histories:
             self.message_histories[session_id] = SessionChatMessageHistory(session_id)
         return self.message_histories[session_id]
-    # [Step 1] 질문 의도 추론: 사용자의 모호한 질문을 DB 검색에 유리한 공식 키워드로 변환
-    async def _infer_intent_and_rewrite(self, query: str) -> str:
-        """사용자의 질문에서 검색 의도를 정확히 추출 (XML 태그로 출력 강제)"""
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", """당신은 사내 인사 규정 검색을 위한 냉철한 키워드 추출기입니다.
-사용자의 질문 내용(출산, 질병, 경조사 등)에 절대 감정적으로 동요하거나 공감하지 마세요. 축하, 위로, 인사말, 설명은 엄격히 금지됩니다.
-오직 사내 규정 DB에서 검색할 공식 키워드 3~4개만 추출하세요.
 
-[출력 규칙]
-1. 반드시 <intent>키워드1, 키워드2, ...</intent> 형식으로만 답변하세요.
-2. 태그 밖에는 어떠한 텍스트도 절대 출력하지 마세요.
+    # ────────────────────────────
+    # STEP 1: 의도 추론 & 쿼리 재작성
+    # ────────────────────────────
+
+    async def _infer_intent_and_rewrite(self, query: str) -> str:
+        """
+        사용자의 캐주얼한 질문에서 검색 키워드를 추출한다.
+        LLM 환각 발생 시 원본 질문으로 안전하게 롤백하는 물리적 방어막 적용.
+        """
+        prompt = ChatPromptTemplate.from_template("""당신은 시스템 내부의 '키워드 추출 API'입니다. 인격을 가지지 마세요.
+사용자의 입력에 절대 감정적으로 반응하거나, 위로, 축하, 부연 설명을 하지 마세요.
+오직 사내 규정 DB 검색을 위한 핵심 키워드 3~5개만 <intent> 태그 안에 출력하세요.
 
 [예시]
-- 질문: "아 오늘 컨디션이 별로인데 어떡하지" -> <intent>병가 규정, 연차 신청, 유급 휴가</intent>
-- 질문: "나 어제 출산했는데 회사는 어떡해?" -> <intent>산전후 휴가, 출산 휴가, 모성 보호, 유급 휴일</intent>
-- 질문: "가족이 돌아가셨어..." -> <intent>경조사 휴가, 청원 휴가, 장례 지원</intent>"""),
-            ("human", "{input}")
-        ])
+입력: "나 어제 출산했는데 회사는 어떡해?"
+출력: <intent>산전후 휴가, 출산 휴가, 모성 보호</intent>
+
+입력: "오늘 몸이 너무 안 좋은데..."
+출력: <intent>병가 규정, 연차 신청, 유급 휴가</intent>
+
+[실제 처리할 입력]
+입력: "{input}"
+출력:""")
+        
         chain = prompt | self.intent_llm
         try:
             response = await chain.ainvoke({"input": query})
             content = response.content.strip()
-
-            # 정규표현식을 사용하여 <intent> 태그 내부의 키워드만 추출 (LLM의 불필요한 서술 방지)
+            
+            # 정규식으로 <intent> 태그 내부 텍스트 추출
             import re
             match = re.search(r"<intent>(.*?)</intent>", content, re.DOTALL)
-            rewritten = match.group(1).strip() if match else content
-            logger.info(f"[Intent] '{query}' -> '{rewritten}'")
+            
+            # ★ 핵심 안전장치: 태그가 없으면 헛소리(content)를 버리고 원본 질문(query)으로 롤백!
+            if match:
+                rewritten = match.group(1).strip()
+            else:
+                logger.warning(f"[Intent Warning] LLM 환각 발생(태그 누락). 원본 질문으로 롤백: {content[:50]}...")
+                return query 
+                
+            logger.info(f"[Intent] '{query}' → '{rewritten}'")
             return rewritten
+            
         except Exception as e:
             logger.warning(f"Intent inference failed: {e}")
             return query
 
-    # [Step 2] 문서 검색: 추론된 키워드를 바탕으로 DB(Supabase/pgvector)에서 관련 조항 탐색
-    async def retrieve(self, query: str, top_k: int = 5) -> list[RetrievedDoc]:
-        """추론된 의도를 바탕으로 문서 검색"""
-        # 의도 추론된 키워드 획득
-        search_query = await self._infer_intent_and_rewrite(query)
-        # 키워드를 벡터로 변환
+    # ────────────────────────────
+    # STEP 2: 벡터 검색
+    # ────────────────────────────
+
+    async def _retrieve_with_query(self, search_query: str, top_k: int = 5) -> list[RetrievedDoc]:
+        """
+        이미 재작성된 쿼리로 바로 DB 검색.
+        answer_with_rag_stream 에서 search_query를 직접 넘겨 중복 재작성 방지.
+        """
         query_emb = await self.embeddings.aembed_query(search_query)
 
-        # 유사도 0.65 이상인 문서를 최대 top_k개 가져옴 (0.65는 검색 범위를 넓히기 위한 수치)
+        # ★ 임계값 0.65로 통일 (이전에 0.72 분기가 문서를 버리던 문제 해소)
         threshold = 0.65
         sql = """
             SELECT id::text, title, page_num, chunk_index, content,
                    (1 - (embedding <=> $1))::float AS similarity
-            FROM documents WHERE (1 - (embedding <=> $1)) >= $2
-            ORDER BY embedding <=> $1 LIMIT $3
+            FROM documents
+            WHERE (1 - (embedding <=> $1)) >= $2
+            ORDER BY embedding <=> $1
+            LIMIT $3
         """
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(sql, query_emb, threshold, top_k)
 
-        return [RetrievedDoc(id=r["id"], title=r["title"] or "", page_num=r["page_num"], 
-                             chunk_index=r["chunk_index"], content=r["content"], similarity=r["similarity"]) for r in rows]
+        docs = [
+            RetrievedDoc(
+                id=r["id"], title=r["title"] or "",
+                page_num=r["page_num"], chunk_index=r["chunk_index"],
+                content=r["content"], similarity=r["similarity"]
+            )
+            for r in rows
+        ]
+        logger.info(f"[Retrieve] query='{search_query}' → {len(docs)}개 문서 (top_sim={docs[0].similarity:.3f} if docs else 'N/A')")
+        return docs
 
-    # [Step 3] 조건부 답변 생성: 검색 결과가 있으면 '문서 기반', 없으면 '일반 상식' 답변 제공
+    # 기존 retrieve() 인터페이스 유지 (외부 호출 호환성)
+    async def retrieve(self, query: str, top_k: int = 5) -> list[RetrievedDoc]:
+        search_query = await self._infer_intent_and_rewrite(query)
+        return await self._retrieve_with_query(search_query, top_k)
+
+    # ────────────────────────────
+    # STEP 3: Answerability Judge
+    # ────────────────────────────
+
+    async def _judge_answerability(
+        self, user_question: str, search_query: str, docs: list[RetrievedDoc]
+    ) -> dict:
+        """
+        검색된 문서로 실제로 질문에 답할 수 있는지 판정한다.
+        - answerable: True/False
+        - evidence_indices: 근거로 쓸 문서 번호 목록 (1-based)
+        - reason: 판정 이유 (로그용)
+        """
+        if not docs:
+            return {"answerable": False, "evidence_indices": [], "reason": "검색 결과 없음"}
+
+        context_summary = "\n".join([
+            f"[{i+1}] {d.title} p.{d.page_num} (유사도 {d.similarity:.2f}): {d.snippet}"
+            for i, d in enumerate(docs)
+        ])
+
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """당신은 RAG 시스템의 answerability 판정기입니다.
+아래 [검색 문서 목록]을 보고, 사용자의 [질문 의도]에 답할 수 있는지 판정하세요.
+
+[판정 기준]
+- answerable=true: 문서 중 하나 이상에 질문에 직접 대응하는 규정/수치/절차가 명시되어 있음
+- answerable=false: 문서는 검색됐지만 질문에 대한 직접적 근거 조항이 없음 (유사 주제만 있는 경우 포함)
+
+[출력 규칙] 반드시 아래 XML만 출력하세요. 다른 텍스트 절대 금지.
+<judge>
+  <answerable>true 또는 false</answerable>
+  <evidence_indices>근거 문서 번호 쉼표 구분, 없으면 빈칸</evidence_indices>
+  <reason>한 줄 이유</reason>
+</judge>"""),
+            ("human", """[질문 의도]: {search_query}
+[원본 질문]: {user_question}
+
+[검색 문서 목록]:
+{context_summary}""")
+        ])
+
+        chain = prompt | self.intent_llm
+        try:
+            response = await chain.ainvoke({
+                "search_query": search_query,
+                "user_question": user_question,
+                "context_summary": context_summary
+            })
+            content = response.content.strip()
+
+            answerable_match = re.search(r"<answerable>(.*?)</answerable>", content, re.DOTALL)
+            indices_match = re.search(r"<evidence_indices>(.*?)</evidence_indices>", content, re.DOTALL)
+            reason_match = re.search(r"<reason>(.*?)</reason>", content, re.DOTALL)
+
+            answerable = (answerable_match.group(1).strip().lower() == "true") if answerable_match else False
+            indices_raw = indices_match.group(1).strip() if indices_match else ""
+            evidence_indices = [int(x.strip()) for x in indices_raw.split(",") if x.strip().isdigit()]
+            reason = reason_match.group(1).strip() if reason_match else "파싱 실패"
+
+            logger.info(f"[Judge] answerable={answerable}, evidence={evidence_indices}, reason={reason}")
+            return {"answerable": answerable, "evidence_indices": evidence_indices, "reason": reason}
+
+        except Exception as e:
+            logger.warning(f"Answerability judge failed: {e}")
+            # 판정 실패 시 안전하게 answerable=True로 fallback (검색된 문서는 일단 사용)
+            return {"answerable": True, "evidence_indices": list(range(1, len(docs) + 1)), "reason": "판정 오류 - 기본 허용"}
+
+    # ────────────────────────────
+    # STEP 4: 컨텍스트 XML 포맷
+    # ────────────────────────────
+
+    @staticmethod
+    def _build_context_xml(docs: list[RetrievedDoc], evidence_indices: list[int] | None = None) -> str:
+        """
+        LLM에게 전달할 컨텍스트를 XML 구조로 포맷.
+        evidence_indices가 주어지면 해당 문서만 포함 (Judge가 선별한 근거 문서).
+        """
+        target_docs = docs
+        if evidence_indices:
+            target_docs = [docs[i - 1] for i in evidence_indices if 1 <= i <= len(docs)]
+        if not target_docs:
+            target_docs = docs  # 선별 실패 시 전체 사용
+
+        blocks = []
+        for i, d in enumerate(target_docs, 1):
+            blocks.append(
+                f'<document index="{i}">\n'
+                f'  <source>{d.title} | {d.page_num}페이지</source>\n'
+                f'  <content>{d.content.strip()}</content>\n'
+                f'</document>'
+            )
+        return "\n\n".join(blocks)
+
+    # ────────────────────────────
+    # STEP 5: 답변 생성 (스트리밍)
+    # ────────────────────────────
+
     async def answer_with_rag_stream(
         self, user_question: str, session_id: str = "default"
     ) -> AsyncGenerator[dict, None]:
-        """최종 답변 생성 파이프라인 (스트리밍 방식)"""
-        
-        # 문서 검색 수행
-        docs = await self.retrieve(user_question)
-        # 검색된 문서 중 가장 높은 유사도 확인
-        top_sim = docs[0].similarity if docs else 0.0
-        
-        # 세션별 대화 이력 로드 (최근 5개 메시지 유지)
+        """
+        전체 RAG 파이프라인:
+        질문 → 의도 추출 → 검색 → Answerability 판정 → 답변 생성
+        """
+
+        # ── STEP 1: 의도 추출 (search_query는 검색 + 프롬프트 양쪽에 사용)
+        search_query = await self._infer_intent_and_rewrite(user_question)
+
+        # ── STEP 2: 검색 (재작성된 쿼리로 직접 검색, 중복 재작성 없음)
+        docs = await self._retrieve_with_query(search_query, top_k=5)
+
         history_obj = self._get_session_history(session_id)
-        recent_history = history_obj.messages[-5:]
+        # 짝수 유지: user/ai 쌍으로 최근 4개 (2턴)
+        recent_history = history_obj.messages[-4:]
+        top_sim = docs[0].similarity if docs else 0.0
 
-        # [분기 A] 검색된 문서의 유사도가 0.72 이상일 때 (확실한 규정이 있을 때)
-        if top_sim >= 0.72:
-            mode = "document"
-            # 검색된 모든 조항을 하나의 텍스트 컨텍스트로 결합
-            context = "\n\n".join([f"[{i+1}] 출처: {d.title} (p.{d.page_num})\n내용: {d.content}" for i, d in enumerate(docs)])
-            
-            # 프론트엔드에 검색 메타데이터 먼저 전송
-            yield {
-                "type": "metadata", "mode": mode, "similarity": top_sim,
-                "sources": [{"title": d.title, "page_num": d.page_num, "similarity": d.similarity, "snippet": d.snippet} for d in docs]
-            }
+        # ══════════════════════════════════════════
+        # [수정 2] 분기: top_sim 기준 제거 → docs 유무로만 판단
+        # 이전: top_sim >= 0.72 → document / else → fallback(일반상식)
+        # 수정: docs가 있으면 무조건 document 시도, 없으면 no_result
+        # ══════════════════════════════════════════
 
-            # 엄격한 규정 준수 프롬프트 설정 (외부 지식 차단)
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", """당신은 회사의 **엄격한 인사 규정 전문가**입니다. 
-제공된 [사내 규정 컨텍스트]에만 100% 근거하여 답변하세요. 
+        if docs:
+            # ── STEP 3: Answerability 판정
+            judge = await self._judge_answerability(user_question, search_query, docs)
 
-[중요 지침]
-1. 당신의 머릿속에 있는 일반적인 법률 상식이나 근로기준법 지식은 **절대 사용하지 마세요.**
-2. 오직 아래 [컨텍스트]에 적힌 텍스트로만 답해야 합니다.
-3. 컨텍스트에 질문에 대한 답이 없다면, "현재 사내 규정 문서에서 관련 내용을 찾을 수 없습니다."라고만 답하세요.
-4. 답변 시 "[1]번 문서에 따르면"과 같이 근거를 명시하세요.
-5. 문장은 상세하고 친절한 한국어로 작성하되, 사실 관계는 철저히 컨텍스트를 따르세요.
+            if judge["answerable"]:
+                # ── CASE A: 문서 근거로 답변 가능
+                yield {
+                    "type": "metadata",
+                    "mode": "document",
+                    "similarity": top_sim,
+                    "sources": [
+                        {"title": d.title, "page_num": d.page_num,
+                         "similarity": d.similarity, "snippet": d.snippet}
+                        for d in docs
+                    ]
+                }
 
-[사내 규정 컨텍스트]
-{context}"""),
-                MessagesPlaceholder(variable_name="history"),
-                ("human", "{input}"),
-            ])
-            
-            chain = prompt | self.answer_llm
-            history_obj.add_message(HumanMessage(content=user_question))
-            yield {"type": "prefix", "text": "[사내 규정 기반 답변]\n"}
-            
-            full_answer = ""
-            # LLM 응답을 실시간 조각(chunk)으로 클라이언트에 전송
-            async for chunk in chain.astream({"input": user_question, "context": context, "history": recent_history}):
-                if chunk.content:
-                    full_answer += chunk.content
-                    yield {"type": "chunk", "text": chunk.content}
-            
-            # 최종 AI 답변을 히스토리에 저장
-            history_obj.add_message(AIMessage(content=full_answer))
+                context_xml = self._build_context_xml(docs, judge["evidence_indices"])
 
-        # [분기 B] 검색 결과가 없거나 불확실할 때 (일반 상식 Fallback)
+                # ════════════════════════════════════════
+                # [수정 3] 강화 프롬프트
+                # - 영어 ABSOLUTE_RULES: Gemini는 영어 규칙에 더 강하게 반응
+                # - XML 컨텍스트 구조화: "이것이 유일한 근거"를 시각적으로 명확히
+                # - [문서 N] 인용 강제: 상식 서술 공간 제거
+                # - USER_INTENT 전달: 검색-생성 단절 해소 (핵심 버그 수정)
+                # ════════════════════════════════════════
+                prompt = ChatPromptTemplate.from_messages([
+                    ("system", """You are a strict HR policy assistant. Follow these rules WITHOUT EXCEPTION.
+
+<ABSOLUTE_RULES>
+RULE 1: Your ONLY knowledge source is the XML <CONTEXT> below. Nothing else.
+RULE 2: NEVER use pre-trained knowledge, general labor law, or common sense.
+RULE 3: EVERY factual sentence MUST end with a citation like [문서 1] or [문서 2].
+RULE 4: Structure your answer EXACTLY as:
+  【결론】(핵심 답변 1~2문장)
+  【근거】(관련 조항/규정 인용, 반드시 [문서 N] 포함)
+  【적용 조건】(해당되는 경우만, 조건/예외 사항)
+  【다음 단계】(신청 방법, 담당 부서 등 실용적 안내)
+RULE 5: If <CONTEXT> does not contain the answer, output ONLY:
+  "현재 사내 규정 문서에서 관련 내용을 찾을 수 없습니다. 인사팀에 직접 문의해 주세요."
+RULE 6: Do NOT add any information not explicitly written in <CONTEXT>.
+RULE 7: Do NOT write paragraphs without citations.
+</ABSOLUTE_RULES>
+
+<CONTEXT>
+{context}
+</CONTEXT>
+
+<USER_INTENT>
+{search_query}
+</USER_INTENT>
+
+위 규칙을 반드시 준수하며 한국어로 답변하세요."""),
+                    MessagesPlaceholder(variable_name="history"),
+                    ("human", "{input}"),
+                ])
+
+                chain = prompt | self.answer_llm
+                history_obj.add_message(HumanMessage(content=user_question))
+                yield {"type": "prefix", "text": "[사내 규정 기반 답변]\n"}
+
+                full_answer = ""
+                async for chunk in chain.astream({
+                    "input": user_question,
+                    "context": context_xml,
+                    "search_query": search_query,  # ★ 핵심 버그 수정: 재작성 쿼리 전달
+                    "history": recent_history
+                }):
+                    if chunk.content:
+                        full_answer += chunk.content
+                        yield {"type": "chunk", "text": chunk.content}
+
+                history_obj.add_message(AIMessage(content=full_answer))
+
+            else:
+                # ── CASE B: 문서는 있지만 직접적 근거 없음
+                # → 상식 답변 금지, "관련 문서 발견했으나 명시 조항 없음" 안내
+                yield {
+                    "type": "metadata",
+                    "mode": "insufficient",
+                    "similarity": top_sim,
+                    "sources": [
+                        {"title": d.title, "page_num": d.page_num,
+                         "similarity": d.similarity, "snippet": d.snippet}
+                        for d in docs
+                    ]
+                }
+                yield {"type": "prefix", "text": "[규정 문서 검색 결과 안내]\n"}
+
+                # 유사 문서는 안내하되 상식 답변은 하지 않음
+                source_list = "\n".join(
+                    [f"- {d.title} ({d.page_num}페이지): {d.snippet}" for d in docs[:3]]
+                )
+                no_evidence_msg = (
+                    f"질문과 관련된 문서를 찾았지만, "
+                    f"'{search_query}'에 대한 명시적인 규정 조항은 확인되지 않았습니다.\n\n"
+                    f"**관련 문서 (참고용)**\n{source_list}\n\n"
+                    f"정확한 내용은 인사팀에 직접 문의하시거나 위 문서를 직접 확인해 주세요."
+                )
+                yield {"type": "chunk", "text": no_evidence_msg}
+                # insufficient 답변은 히스토리에 저장하지 않음 (히스토리 오염 방지)
+
         else:
-            mode = "fallback"
-            yield {"type": "metadata", "mode": mode, "similarity": top_sim, "sources": []}
-            
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", """당신은 사내 규정에서 정보를 찾지 못한 AI 어시스턴트입니다. 
-사용자의 질문에 대해 사내 규정 대신 일반적인 근로기준법이나 사회적 통념을 바탕으로 답변해 주세요.
-
-[답변 원칙]
-1. 답변 시작 시 반드시 **"사내 규정에서 관련 내용을 찾을 수 없지만, 일반적인 상식(또는 근로기준법)으로는 다음과 같습니다."**라고 명시하세요.
-2. 사용자의 상황에 깊이 공감하고, 실질적인 조언(예: 몸이 안 좋을 때 취할 수 있는 조치 등)을 상세히 문장형으로 제공하세요.
-3. 마지막에는 인사팀 등 사내 담당 부서에 한 번 더 확인할 것을 권고하세요."""),
-                MessagesPlaceholder(variable_name="history"),
-                ("human", "{input}"),
-            ])
-            
-            chain = prompt | self.answer_llm
-            history_obj.add_message(HumanMessage(content=user_question))
-            yield {"type": "prefix", "text": "[일반 상식 안내]\n"}
-            
-            full_answer = ""
-            async for chunk in chain.astream({"input": user_question, "history": recent_history}):
-                if chunk.content:
-                    full_answer += chunk.content
-                    yield {"type": "chunk", "text": chunk.content}
-            history_obj.add_message(AIMessage(content=full_answer))
+            # ── CASE C: 검색 결과 자체가 없음 (no_result)
+            # → 일반 상식 답변 완전 제거, 명확한 안내만
+            yield {
+                "type": "metadata",
+                "mode": "no_result",
+                "similarity": 0.0,
+                "sources": []
+            }
+            yield {"type": "prefix", "text": "[규정 문서 미발견]\n"}
+            yield {
+                "type": "chunk",
+                "text": (
+                    "사내 규정 문서에서 관련 내용을 찾을 수 없습니다.\n\n"
+                    "다음을 시도해 보세요:\n"
+                    "1. 질문을 더 구체적인 규정 용어로 바꿔서 다시 질문해 주세요.\n"
+                    "   예) '휴가 신청하고 싶어' → '연차 유급휴가 신청 방법'\n"
+                    "2. 인사팀에 직접 문의해 주세요.\n"
+                )
+            }
+            # no_result도 히스토리에 저장하지 않음
